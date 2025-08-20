@@ -13,6 +13,18 @@ exports.handler = async (event, context) => {
     const text = requestBody.text;
     const voiceName = requestBody.voiceName || 'Kore';
     
+    // פרמטרים נוספים עם ברירת מחדל
+    const temperature = requestBody.temperature || 0.7;
+    const topP = requestBody.topP || 0.9;
+    const topK = requestBody.topK || 40;
+    const maxOutputTokens = requestBody.maxOutputTokens || 8192;
+    const candidateCount = requestBody.candidateCount || 1;
+    const stopSequences = requestBody.stopSequences || [];
+    
+    // פרמטרים של multi-speaker (אופציונלי)
+    const multiSpeaker = requestBody.multiSpeaker || false;
+    const speakerConfigs = requestBody.speakerConfigs || [];
+    
     if (!text) {
       return {
         statusCode: 400,
@@ -20,7 +32,32 @@ exports.handler = async (event, context) => {
       };
     }
 
-    // קריאה ל-Gemini API
+    // בניית speechConfig בהתאם לפרמטרים
+    let speechConfig;
+    if (multiSpeaker && speakerConfigs.length > 0) {
+      speechConfig = {
+        multiSpeakerVoiceConfig: {
+          speakerVoiceConfigs: speakerConfigs.map(config => ({
+            speaker: config.speaker,
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: config.voiceName || 'Kore'
+              }
+            }
+          }))
+        }
+      };
+    } else {
+      speechConfig = {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: voiceName
+          }
+        }
+      };
+    }
+
+    // קריאה ל-Gemini API עם פרמטרים מתקדמים
     const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent', {
       method: 'POST',
       headers: {
@@ -34,14 +71,14 @@ exports.handler = async (event, context) => {
           }]
         }],
         generationConfig: {
+          temperature: temperature,
+          topP: topP,
+          topK: topK,
+          maxOutputTokens: maxOutputTokens,
+          candidateCount: candidateCount,
+          stopSequences: stopSequences,
           responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: voiceName
-              }
-            }
-          }
+          speechConfig: speechConfig
         }
       })
     });
