@@ -4,12 +4,46 @@ exports.handler = async (event, context) => {
   if (event.httpMethod !== 'POST') {
     return {
       statusCode: 405,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST',
+        'Access-Control-Allow-Headers': 'Content-Type'
+      },
       body: JSON.stringify({ error: 'Method not allowed' })
     };
   }
 
+  // בדיקת API key
+  if (!process.env.GEMINI_API_KEY) {
+    return {
+      statusCode: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      },
+      body: JSON.stringify({ error: 'API key not configured' })
+    };
+  }
+
   try {
-    const requestBody = JSON.parse(event.body);
+    let requestBody;
+    try {
+      requestBody = JSON.parse(event.body);
+    } catch (parseError) {
+      return {
+        statusCode: 400,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        },
+        body: JSON.stringify({ 
+          error: 'Invalid JSON in request body',
+          details: parseError.message 
+        })
+      };
+    }
+
     const text = requestBody.text;
     const voiceName = requestBody.voiceName || 'Kore';
     
