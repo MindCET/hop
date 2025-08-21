@@ -1,6 +1,5 @@
 // netlify/functions/gemini-tts.js
 exports.handler = async (event, context) => {
-  // בדיקת HTTP method
   if (event.httpMethod !== 'POST') {
     return {
       statusCode: 405,
@@ -14,7 +13,6 @@ exports.handler = async (event, context) => {
     };
   }
 
-  // בדיקת API key
   if (!process.env.GEMINI_API_KEY) {
     return {
       statusCode: 500,
@@ -37,28 +35,47 @@ exports.handler = async (event, context) => {
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*'
         },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           error: 'Invalid JSON in request body',
-          details: parseError.message 
+          details: parseError.message
         })
       };
     }
 
     const text = requestBody.text;
     const voiceName = requestBody.voiceName || 'Kore';
-    
-    // פרמטרים נוספים עם ברירת מחדל ו-validation
+
+    // ✅ NEW: בחירת מודל
+    // אפשר גם לשים ברירת־מחדל ב־ENV בשם GEMINI_TTS_MODEL
+    const DEFAULT_TTS_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
+    const requestedModel = typeof requestBody.model === 'string' ? requestBody.model.trim() : '';
+    const model = sanitizeModel(requestedModel) || DEFAULT_TTS_MODEL;
+
+    // כדי למנוע שימוש במודל שאינו TTS (כי הבקשה כאן דורשת AUDIO)
+    if (!isTTSModel(model)) {
+      return {
+        statusCode: 400,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        },
+        body: JSON.stringify({
+          error: 'Selected model is not a TTS-capable model',
+          details: `Model "${model}" must be a Gemini TTS model (e.g., gemini-*-tts).`
+        })
+      };
+    }
+
     const temperature = Math.min(Math.max(requestBody.temperature || 0.7, 0.0), 2.0);
     const topP = Math.min(Math.max(requestBody.topP || 0.9, 0.0), 1.0);
     const topK = Math.min(Math.max(requestBody.topK || 40, 1), 100);
     const maxOutputTokens = Math.min(Math.max(requestBody.maxOutputTokens || 8192, 1), 32768);
-    const candidateCount = 1; // תמיד 1 ל-TTS
+    const candidateCount = 1;
     const stopSequences = Array.isArray(requestBody.stopSequences) ? requestBody.stopSequences : [];
-    
-    // פרמטרים של multi-speaker (אופציונלי)
+
     const multiSpeaker = requestBody.multiSpeaker || false;
     const speakerConfigs = Array.isArray(requestBody.speakerConfigs) ? requestBody.speakerConfigs : [];
-    
+
     if (!text || typeof text !== 'string' || text.trim().length === 0) {
       return {
         statusCode: 400,
@@ -70,7 +87,6 @@ exports.handler = async (event, context) => {
       };
     }
 
-    // בניית speechConfig בהתאם לפרמטרים
     let speechConfig;
     if (multiSpeaker && speakerConfigs.length > 0) {
       speechConfig = {
@@ -95,28 +111,26 @@ exports.handler = async (event, context) => {
       };
     }
 
-    // קריאה ל-Gemini API עם פרמטרים מתקדמים
-    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent', {
+    // ✅ שימוש במודל הנבחר ב־URL
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'x-goog-api-key': process.env.GEMINI_API_KEY,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        contents: [{
-          parts: [{
-            text: text
-          }]
-        }],
+        contents: [{ parts: [{ text }] }],
         generationConfig: {
-          temperature: temperature,
-          topP: topP,
-          topK: topK,
-          maxOutputTokens: maxOutputTokens,
-          candidateCount: candidateCount,
-          stopSequences: stopSequences,
+          temperature,
+          topP,
+          topK,
+          maxOutputTokens,
+          candidateCount,
+          stopSequences,
           responseModalities: ['AUDIO'],
-          speechConfig: speechConfig
+          speechConfig
         }
       })
     });
@@ -129,31 +143,25 @@ exports.handler = async (event, context) => {
 
     const data = await response.json();
     console.log('Gemini response:', JSON.stringify(data, null, 2));
-    
-    // בדיקה שהתגובה תקינה
+
     if (!data.candidates || data.candidates.length === 0) {
       throw new Error('No candidates in response');
     }
-    
+
     const candidate = data.candidates[0];
     if (!candidate.content || !candidate.content.parts || candidate.content.parts.length === 0) {
       throw new Error('No content parts in response');
     }
-    
+
     const part = candidate.content.parts[0];
     if (!part.inlineData || !part.inlineData.data) {
       throw new Error('No inline data in response part');
     }
-    
+
     const audioBase64 = part.inlineData.data;
-    
-    // המרת base64 לPCM
     const pcmBuffer = Buffer.from(audioBase64, 'base64');
-    
-    // המרה לWAV (פונקציה פשוטה)
     const wavBuffer = pcmToWav(pcmBuffer);
-    
-    // החזרת הקובץ כbase64 ל-Bubble
+
     return {
       statusCode: 200,
       headers: {
@@ -164,6 +172,7 @@ exports.handler = async (event, context) => {
       },
       body: JSON.stringify({
         success: true,
+        modelUsed: model,            // ✅ נחמד לדיבוג
         audioData: wavBuffer.toString('base64'),
         mimeType: 'audio/wav',
         fileName: `tts_${Date.now()}.wav`
@@ -172,12 +181,9 @@ exports.handler = async (event, context) => {
 
   } catch (error) {
     console.error('Error details:', error);
-    
-    // לוג נוסף למקרה של שגיאת parsing
     if (error.message.includes('JSON')) {
       console.error('JSON parsing error, raw response might be available');
     }
-    
     return {
       statusCode: 500,
       headers: {
@@ -186,7 +192,7 @@ exports.handler = async (event, context) => {
         'Access-Control-Allow-Methods': 'POST',
         'Access-Control-Allow-Headers': 'Content-Type'
       },
-      body: JSON.stringify({ 
+      body: JSON.stringify({
         error: 'Internal server error',
         details: error.message,
         timestamp: new Date().toISOString()
@@ -195,15 +201,28 @@ exports.handler = async (event, context) => {
   }
 };
 
-// פונקציה להמרת PCM ל-WAV
+// ✅ NEW: סניטיזציה לשם המודל (למנוע תווים בעייתיים ב־URL)
+function sanitizeModel(name) {
+  if (!name) return '';
+  const ok = /^[A-Za-z0-9._\-]+$/.test(name);
+  return ok ? name : '';
+}
+
+// ✅ NEW: אימות בסיסי שמדובר במודל TTS
+function isTTSModel(name) {
+  // כלל אצבע: מודלי TTS ב-Gemini מכילים 'tts' בשם המודל.
+  // אם תרצה, אפשר להחליף ל-allowlist ידני לפי מה שזמין אצלך.
+  return typeof name === 'string' && /tts/i.test(name);
+}
+
+// קיימת אצלך
 function pcmToWav(pcmBuffer, sampleRate, channels, bitsPerSample) {
   sampleRate = sampleRate || 24000;
   channels = channels || 1;
   bitsPerSample = bitsPerSample || 16;
   const length = pcmBuffer.length;
   const buffer = Buffer.alloc(44 + length);
-  
-  // WAV Header
+
   buffer.write('RIFF', 0);
   buffer.writeUInt32LE(36 + length, 4);
   buffer.write('WAVE', 8);
@@ -217,9 +236,7 @@ function pcmToWav(pcmBuffer, sampleRate, channels, bitsPerSample) {
   buffer.writeUInt16LE(bitsPerSample, 34);
   buffer.write('data', 36);
   buffer.writeUInt32LE(length, 40);
-  
-  // PCM Data
+
   pcmBuffer.copy(buffer, 44);
-  
   return buffer;
 }
