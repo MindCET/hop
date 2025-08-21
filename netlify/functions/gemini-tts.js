@@ -13,22 +13,26 @@ exports.handler = async (event, context) => {
     const text = requestBody.text;
     const voiceName = requestBody.voiceName || 'Kore';
     
-    // פרמטרים נוספים עם ברירת מחדל
-    const temperature = requestBody.temperature || 0.7;
-    const topP = requestBody.topP || 0.9;
-    const topK = requestBody.topK || 40;
-    const maxOutputTokens = requestBody.maxOutputTokens || 8192;
-    const candidateCount = requestBody.candidateCount || 1;
-    const stopSequences = requestBody.stopSequences || [];
+    // פרמטרים נוספים עם ברירת מחדל ו-validation
+    const temperature = Math.min(Math.max(requestBody.temperature || 0.7, 0.0), 2.0);
+    const topP = Math.min(Math.max(requestBody.topP || 0.9, 0.0), 1.0);
+    const topK = Math.min(Math.max(requestBody.topK || 40, 1), 100);
+    const maxOutputTokens = Math.min(Math.max(requestBody.maxOutputTokens || 8192, 1), 32768);
+    const candidateCount = 1; // תמיד 1 ל-TTS
+    const stopSequences = Array.isArray(requestBody.stopSequences) ? requestBody.stopSequences : [];
     
     // פרמטרים של multi-speaker (אופציונלי)
     const multiSpeaker = requestBody.multiSpeaker || false;
-    const speakerConfigs = requestBody.speakerConfigs || [];
+    const speakerConfigs = Array.isArray(requestBody.speakerConfigs) ? requestBody.speakerConfigs : [];
     
-    if (!text) {
+    if (!text || typeof text !== 'string' || text.trim().length === 0) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ error: 'Text is required' })
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        },
+        body: JSON.stringify({ error: 'Valid text is required' })
       };
     }
 
@@ -84,11 +88,30 @@ exports.handler = async (event, context) => {
     });
 
     if (!response.ok) {
-      throw new Error('Gemini API error');
+      const errorText = await response.text();
+      console.error('Gemini API error:', response.status, errorText);
+      throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
     }
 
     const data = await response.json();
-    const audioBase64 = data.candidates[0].content.parts[0].inlineData.data;
+    console.log('Gemini response:', JSON.stringify(data, null, 2));
+    
+    // בדיקה שהתגובה תקינה
+    if (!data.candidates || data.candidates.length === 0) {
+      throw new Error('No candidates in response');
+    }
+    
+    const candidate = data.candidates[0];
+    if (!candidate.content || !candidate.content.parts || candidate.content.parts.length === 0) {
+      throw new Error('No content parts in response');
+    }
+    
+    const part = candidate.content.parts[0];
+    if (!part.inlineData || !part.inlineData.data) {
+      throw new Error('No inline data in response part');
+    }
+    
+    const audioBase64 = part.inlineData.data;
     
     // המרת base64 לPCM
     const pcmBuffer = Buffer.from(audioBase64, 'base64');
@@ -114,12 +137,25 @@ exports.handler = async (event, context) => {
     };
 
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Error details:', error);
+    
+    // לוג נוסף למקרה של שגיאת parsing
+    if (error.message.includes('JSON')) {
+      console.error('JSON parsing error, raw response might be available');
+    }
+    
     return {
       statusCode: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST',
+        'Access-Control-Allow-Headers': 'Content-Type'
+      },
       body: JSON.stringify({ 
         error: 'Internal server error',
-        details: error.message 
+        details: error.message,
+        timestamp: new Date().toISOString()
       })
     };
   }
