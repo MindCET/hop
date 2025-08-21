@@ -1,14 +1,17 @@
 // netlify/functions/gemini-tts.js
+const TTS_MODELS = [
+  "models/gemini-2.5-pro-preview-tts",
+  "models/gemini-2.5-flash-preview-tts"
+];
+
+// נקבע ברירת מחדל (אפשר גם להגדיר GEMINI_TTS_MODEL ב־ENV)
+const DEFAULT_TTS_MODEL = process.env.GEMINI_TTS_MODEL || TTS_MODELS[1];
+
 exports.handler = async (event, context) => {
   if (event.httpMethod !== 'POST') {
     return {
       statusCode: 405,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'POST',
-        'Access-Control-Allow-Headers': 'Content-Type'
-      },
+      headers: corsHeaders(),
       body: JSON.stringify({ error: 'Method not allowed' })
     };
   }
@@ -16,10 +19,7 @@ exports.handler = async (event, context) => {
   if (!process.env.GEMINI_API_KEY) {
     return {
       statusCode: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      },
+      headers: corsHeaders(),
       body: JSON.stringify({ error: 'API key not configured' })
     };
   }
@@ -31,10 +31,7 @@ exports.handler = async (event, context) => {
     } catch (parseError) {
       return {
         statusCode: 400,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        },
+        headers: corsHeaders(),
         body: JSON.stringify({
           error: 'Invalid JSON in request body',
           details: parseError.message
@@ -43,136 +40,52 @@ exports.handler = async (event, context) => {
     }
 
     const text = requestBody.text;
-    const voiceName = requestBody.voiceName || 'Kore';
-
-    // ✅ NEW: בחירת מודל
-    // אפשר גם לשים ברירת־מחדל ב־ENV בשם GEMINI_TTS_MODEL
-    const DEFAULT_TTS_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
-    const requestedModel = typeof requestBody.model === 'string' ? requestBody.model.trim() : '';
-    const model = sanitizeModel(requestedModel) || DEFAULT_TTS_MODEL;
-
-    // כדי למנוע שימוש במודל שאינו TTS (כי הבקשה כאן דורשת AUDIO)
-    if (!isTTSModel(model)) {
-      return {
-        statusCode: 400,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        },
-        body: JSON.stringify({
-          error: 'Selected model is not a TTS-capable model',
-          details: `Model "${model}" must be a Gemini TTS model (e.g., gemini-*-tts).`
-        })
-      };
-    }
-
-    const temperature = Math.min(Math.max(requestBody.temperature || 0.7, 0.0), 2.0);
-    const topP = Math.min(Math.max(requestBody.topP || 0.9, 0.0), 1.0);
-    const topK = Math.min(Math.max(requestBody.topK || 40, 1), 100);
-    const maxOutputTokens = Math.min(Math.max(requestBody.maxOutputTokens || 8192, 1), 32768);
-    const candidateCount = 1;
-    const stopSequences = Array.isArray(requestBody.stopSequences) ? requestBody.stopSequences : [];
-
-    const multiSpeaker = requestBody.multiSpeaker || false;
-    const speakerConfigs = Array.isArray(requestBody.speakerConfigs) ? requestBody.speakerConfigs : [];
-
     if (!text || typeof text !== 'string' || text.trim().length === 0) {
       return {
         statusCode: 400,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        },
+        headers: corsHeaders(),
         body: JSON.stringify({ error: 'Valid text is required' })
       };
     }
 
-    let speechConfig;
-    if (multiSpeaker && speakerConfigs.length > 0) {
-      speechConfig = {
-        multiSpeakerVoiceConfig: {
-          speakerVoiceConfigs: speakerConfigs.map(config => ({
-            speaker: config.speaker,
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: config.voiceName || 'Kore'
-              }
-            }
-          }))
-        }
-      };
-    } else {
-      speechConfig = {
-        voiceConfig: {
-          prebuiltVoiceConfig: {
-            voiceName: voiceName
-          }
-        }
-      };
-    }
+    const voiceName = requestBody.voiceName || 'Kore';
+    const requestedModel = typeof requestBody.model === 'string' ? requestBody.model.trim() : '';
+    const model = TTS_MODELS.includes(requestedModel) ? requestedModel : DEFAULT_TTS_MODEL;
 
-    // ✅ שימוש במודל הנבחר ב־URL
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    // פרמטרים נוספים
+    const temperature = Math.min(Math.max(requestBody.temperature || 0.7, 0.0), 2.0);
+    const topP = Math.min(Math.max(requestBody.topP || 0.9, 0.0), 1.0);
+    const topK = Math.min(Math.max(requestBody.topK || 40, 1), 100);
+    const maxOutputTokens = Math.min(Math.max(requestBody.maxOutputTokens || 8192, 1), 32768);
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'x-goog-api-key': process.env.GEMINI_API_KEY,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text }] }],
-        generationConfig: {
-          temperature,
-          topP,
-          topK,
-          maxOutputTokens,
-          candidateCount,
-          stopSequences,
-          responseModalities: ['AUDIO'],
-          speechConfig
-        }
-      })
+    // הגדרות קול
+    const speechConfig = {
+      voiceConfig: {
+        prebuiltVoiceConfig: { voiceName }
+      }
+    };
+
+    // ✅ שליחת בקשה עם fallback בין המודלים
+    const { audioBase64, modelUsed } = await tryModelsSequentially({
+      text,
+      model,
+      voiceName,
+      speechConfig,
+      temperature,
+      topP,
+      topK,
+      maxOutputTokens
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Gemini API error:', response.status, errorText);
-      throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
-    }
-
-    const data = await response.json();
-    console.log('Gemini response:', JSON.stringify(data, null, 2));
-
-    if (!data.candidates || data.candidates.length === 0) {
-      throw new Error('No candidates in response');
-    }
-
-    const candidate = data.candidates[0];
-    if (!candidate.content || !candidate.content.parts || candidate.content.parts.length === 0) {
-      throw new Error('No content parts in response');
-    }
-
-    const part = candidate.content.parts[0];
-    if (!part.inlineData || !part.inlineData.data) {
-      throw new Error('No inline data in response part');
-    }
-
-    const audioBase64 = part.inlineData.data;
     const pcmBuffer = Buffer.from(audioBase64, 'base64');
     const wavBuffer = pcmToWav(pcmBuffer);
 
     return {
       statusCode: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'POST',
-        'Access-Control-Allow-Headers': 'Content-Type'
-      },
+      headers: corsHeaders(),
       body: JSON.stringify({
         success: true,
-        modelUsed: model,            // ✅ נחמד לדיבוג
+        modelUsed,
         audioData: wavBuffer.toString('base64'),
         mimeType: 'audio/wav',
         fileName: `tts_${Date.now()}.wav`
@@ -181,17 +94,9 @@ exports.handler = async (event, context) => {
 
   } catch (error) {
     console.error('Error details:', error);
-    if (error.message.includes('JSON')) {
-      console.error('JSON parsing error, raw response might be available');
-    }
     return {
       statusCode: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'POST',
-        'Access-Control-Allow-Headers': 'Content-Type'
-      },
+      headers: corsHeaders(),
       body: JSON.stringify({
         error: 'Internal server error',
         details: error.message,
@@ -201,25 +106,72 @@ exports.handler = async (event, context) => {
   }
 };
 
-// ✅ NEW: סניטיזציה לשם המודל (למנוע תווים בעייתיים ב־URL)
-function sanitizeModel(name) {
-  if (!name) return '';
-  const ok = /^[A-Za-z0-9._\-]+$/.test(name);
-  return ok ? name : '';
+// פונקציה שמנסה מודל ראשי ואז fallback
+async function tryModelsSequentially({ text, model, voiceName, speechConfig, temperature, topP, topK, maxOutputTokens }) {
+  const modelsToTry = [model, ...TTS_MODELS.filter(m => m !== model)];
+
+  for (const m of modelsToTry) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/${m}:generateContent`;
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'x-goog-api-key': process.env.GEMINI_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text }] }],
+          generationConfig: {
+            temperature,
+            topP,
+            topK,
+            maxOutputTokens,
+            candidateCount: 1,
+            stopSequences: [],
+            responseModalities: ['AUDIO'],
+            speechConfig
+          }
+        })
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error(`Gemini API error [${m}]:`, response.status, errText);
+
+        if (response.status === 429) {
+          console.warn(`Model ${m} quota exceeded, trying fallback...`);
+          continue; // נעבור למודל הבא
+        }
+
+        throw new Error(`Gemini API error ${response.status}: ${errText}`);
+      }
+
+      const data = await response.json();
+      const audioBase64 = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!audioBase64) throw new Error('No audio data in response');
+
+      return { audioBase64, modelUsed: m };
+
+    } catch (err) {
+      console.error(`Error with model ${m}:`, err.message);
+      if (m === modelsToTry[modelsToTry.length - 1]) throw err; // האחרון? זורקים שגיאה
+    }
+  }
 }
 
-// ✅ NEW: אימות בסיסי שמדובר במודל TTS
-function isTTSModel(name) {
-  // כלל אצבע: מודלי TTS ב-Gemini מכילים 'tts' בשם המודל.
-  // אם תרצה, אפשר להחליף ל-allowlist ידני לפי מה שזמין אצלך.
-  return typeof name === 'string' && /tts/i.test(name);
+// Helper headers
+function corsHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'POST',
+    'Access-Control-Allow-Headers': 'Content-Type'
+  };
 }
 
-// קיימת אצלך
-function pcmToWav(pcmBuffer, sampleRate, channels, bitsPerSample) {
-  sampleRate = sampleRate || 24000;
-  channels = channels || 1;
-  bitsPerSample = bitsPerSample || 16;
+// Helper: PCM ➝ WAV
+function pcmToWav(pcmBuffer, sampleRate = 24000, channels = 1, bitsPerSample = 16) {
   const length = pcmBuffer.length;
   const buffer = Buffer.alloc(44 + length);
 
